@@ -9,6 +9,7 @@
 
 (require 'url)
 (require 'let-alist)
+(require 'ansi-color)
 
 
 (defgroup teamcity nil
@@ -43,6 +44,9 @@
 
 (defvar teamcity-project nil
   "Currently focused teamcity project.")
+
+(defvar teamcity-status--timer nil
+  "Teamcity build status refresh timer.")
 
 (defun teamcity-login ()
   "Logs in to teamcity by fetching the token from .authinfo."
@@ -84,29 +88,28 @@
   "Perform a METHOD request synchronously to a teamcity rest RESOURCE with DATA and parse to xml."
   (let ((url-request-extra-headers (list (teamcity-login) `("Origin" . ,teamcity-url) '("Content-Type" . "application/xml")))
         (url-request-method method)
-        (url-request-data data)
-        (buffer (current-buffer)))
+        (url-request-data data))
     (with-current-buffer (url-retrieve-synchronously (format "%s/app/rest/%s" teamcity-url resource))
       (xml-parse-region url-http-end-of-headers (point-max)))))
-
-(defun teamcity--explore (resource method data)
-  "Print out the response to a given teamcity RESOURCE."
-  (print (teamcity--request-synchronously resource method data)))
 
 ;; (teamcity--explore "projects/id:Clockwork_Backend/branches?fields=branch(name)" "GET" nil)
 ;;
 
 
-(defun teamcity-branch (branch)
-  "Displays the status of the latest teamcity build on BRANCH."
+(defun teamcity-status--update (branch)
+  "Update the status of the latest teamcity build on BRANCH."
   (teamcity--request (format "builds?locator=running:any,branch:name:%s,buildType:project:%s,count:1" branch teamcity-project)
                      "GET"
                      nil
                      (lambda (xml)
                        (let-alist xml
-                         (setq mode-line-process (teamcity--propertize-status (nth 1 .builds)))))))
+                         (setq mode-line-process (teamcity--propertize-status (nth 1 .builds))
+                               teamcity-status--timer (run-at-time 30 nil (lambda () (teamcity-status--update branch))))
+                         ))
+                     ))
 
 (defun teamcity-browse-branch (branch)
+  "Open the BRANCH in a web browser."
   (teamcity--request (format "builds?locator=running:any,branch:name:%s" branch)
                      "GET"
                      nil
@@ -115,10 +118,11 @@
                          (let-alist (cadr (nth 1 .builds))
                            (browse-url .webUrl))))))
 
-(defun teamcity-trigger-branch (branch)
+(defun teamcity-trigger-build (build-conf branch)
+  "Trigger a build using BUILD-CONF on the given BRANCH."
   (teamcity--request "buildQueue"
                      "POST"
-                     (xmlgen `(build :branchName ,branch (buildType :id "Clockwork_Backend_BackendBuild")))
+                     (xmlgen `(build :branchName ,branch (buildType :id ,build-conf)))
                      (lambda (xml) (print xml))))
 
 ;; (defun teamcity-queue--list)
@@ -146,13 +150,30 @@
 
 (defun teamcity-branch-list ()
   "List all of the teamcity branches, along with the status of the last build."
-  (let-alist (teamcity--request-synchronously (format "projects/id:%s/branches?fields=branch(name)" teamcity-project) "GET" nil)
+  (let-alist (teamcity--request-synchronously (format "projects/id:%s/branches" teamcity-project) "GET" nil)
     (mapcar (lambda (branch)
               (let-alist (cadr branch)
-                (let ((status (teamcity--branch-status .name))
-                      (name .name))
-                  (let-alist (cadr status)
-                    (cons (concat (teamcity--propertize-status status) " " name) .webUrl)))))(cdr .branches))))
+                (let ((status (teamcity--branch-status .name)))
+                  (cons (concat (teamcity--propertize-status status) " " .name) (cadr status)))))(cdr .branches))))
+
+(defun teamcity-configuration-list ()
+  "List all build configurations for the selected branch."
+  (let-alist (teamcity--request-synchronously (format "buildTypes?locator=project:id:%s" teamcity-project) "GET" nil)
+    (mapcar (lambda (type)
+              (let-alist (cadr type)
+                (cons .name .id))) (cdr .buildTypes))))
+
+(defun teamcity-build-log (build-id)
+  "Get the build log for BUILD-ID."
+  (let ((log-buffer-name (format "*build-log-%s*" build-id)))
+    (unless (get-buffer log-buffer-name)
+      (display-buffer (with-current-buffer (url-retrieve-synchronously (format "%s/httpAuth/downloadBuildLog.html?buildId=%s" teamcity-url build-id))
+                        (delete-region (point-min) url-http-end-of-headers)
+                        (delete-trailing-whitespace (point-min) (point-max))
+                        (while (re-search-forward "\\[[0-9,?]+[a-z]" nil t)
+                          (replace-match (concat "" (match-string 0))))
+                        (ansi-color-apply-on-region (point-min) (point-max))
+                        (rename-buffer log-buffer-name))))))
 
 (defun teamcity-queue-transformer (build)
   "Ivy transformer for a given BUILD."
@@ -178,26 +199,44 @@
             :action (lambda (project) (setq teamcity-project (cdr project)))
             :caller 'teamcity-projects))
 
-
 (defun teamcity-branches ()
   "Browse teamcity branches."
   (interactive)
   (ivy-read "Select Branch: " (teamcity-branch-list)
-            :action (lambda (branch) (browse-url (cdr branch)))
+            :action (lambda (branch) (let-alist (cdr branch) (browse-url .webUrl)))
             :caller 'teamcity-branches))
+
+(defun teamcity-branches-build (branch)
+  "Select a build configuration on a given BRANCH."
+  (ivy-read "Build Configuration: " (teamcity-configuration-list)
+            :action (lambda (build-conf) (teamcity-trigger-build (cdr build-conf) branch))
+            :caller 'teamcity-branches-build))
 
 (ivy-set-display-transformer 'teamcity-queue 'teamcity-queue-transformer)
 (ivy-set-display-transformer 'teamcity-projects 'teamcity-project-transformer)
+
+(ivy-set-actions
+ 'teamcity-branches
+ '(("r" (lambda (branch) (let-alist (cdr branch) (teamcity-branches-build .branchName))) "rerun")
+   ("l" (lambda (branch) (let-alist (cdr branch) (teamcity-build-log .id))) "log")))
 
 (defun teamcity-browse ()
   "Opens the latest teamcity build for the current branch."
   (interactive)
   (teamcity-browse-branch (magit-get-current-branch)))
 
-(defun teamcity-status ()
-  "Displays the status of the latest teamcity build for the current branch."
-  (interactive)
-  (teamcity-branch (magit-get-current-branch)))
+(defun teamcity-status--toggle-mode (enable)
+  "Toggle the teamcity mode based off of ENABLE."
+  (if enable
+      (cancel-timer teamcity-status--timer)
+    (teamcity-status--update (magit-get-current-branch))
+    ))
+
+(define-minor-mode teamcity-status-mode
+  "Monitor the build status of the current branch."
+  :global t
+  :variable (t . teamcity-status--toggle-mode)
+  )
 
 (provide 'teamcity)
 ;;; teamcity.el ends here
