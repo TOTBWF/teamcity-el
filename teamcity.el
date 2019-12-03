@@ -92,10 +92,6 @@
     (with-current-buffer (url-retrieve-synchronously (format "%s/app/rest/%s" teamcity-url resource))
       (xml-parse-region url-http-end-of-headers (point-max)))))
 
-;; (teamcity--explore "projects/id:Clockwork_Backend/branches?fields=branch(name)" "GET" nil)
-;;
-
-
 (defun teamcity-status--update (branch)
   "Update the status of the latest teamcity build on BRANCH."
   (teamcity--request (format "builds?locator=running:any,branch:name:%s,buildType:project:%s,count:1" branch teamcity-project)
